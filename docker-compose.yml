@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  crawler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    depends_on:
+      - db
+    networks:
+      - crawler-network
+
+  db:
+    image: mysql:8.0
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: legal_crawler
+      MYSQL_USER: crawler
+      MYSQL_PASSWORD: crawler_password
+    volumes:
+      - db_data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    networks:
+      - crawler-network
+
+networks:
+  crawler-network:
+    driver: bridge
+
+volumes:
+  db_data:
