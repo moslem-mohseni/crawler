@@ -14,9 +14,11 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 from typing import List, Dict, Tuple, Union, Optional, Any
 
+import pandas as pd
 from sklearn.model_selection import learning_curve
 from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc, precision_recall_curve
 from sklearn.preprocessing import label_binarize
+
 
 # افزودن مسیر پروژه به سیستم
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))

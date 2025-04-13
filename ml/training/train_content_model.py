@@ -32,7 +32,7 @@ sys.path.insert(0, project_root)
 from utils.logger import get_logger
 from utils.text import normalize_persian_text, tokenize_persian_text
 from ml.features import ContentTypeFeatures, CONTENT_TYPE_KEYWORDS
-from ml.train_model_utils import save_model_to_file, load_model_from_file, save_metrics_to_json  # توابع مشترک
+from ml.training.train_model_utils import save_model_to_file, load_model_from_file, save_metrics_to_json  # توابع مشترک
 
 logger = get_logger(__name__)
 

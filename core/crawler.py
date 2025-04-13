@@ -6,12 +6,12 @@
 
 import os
 import time
-import random
 import threading
 import queue
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import urljoin, urlparse
 import json
 from datetime import datetime
+import xml.etree.ElementTree as ET
 
 from utils.logger import get_logger, get_crawler_logger
 from utils.http import RequestManager, normalize_url
@@ -36,7 +36,7 @@ class CrawlJob:
             priority: اولویت برای خزش (مقادیر پایین‌تر اولویت بالاتر دارند)
             parent_url: آدرس URL والد
             referrer: آدرس URL ارجاع‌دهنده
-            job_type: نوع کار ('page', 'list', 'detail', 'api', etc.)
+            job_type: نوع کار ('page', 'list', 'detail', 'api', 'sitemap', etc.)
         """
         self.url = url
         self.depth = depth
@@ -54,6 +54,7 @@ class CrawlJob:
     def __lt__(self, other):
         """
         مقایسه کمتر بودن برای استفاده در صف اولویت
+        اولویت کمتر (عدد کوچکتر) به معنای اولویت بالاتر است
 
         Args:
             other: کار خزش دیگر برای مقایسه
@@ -88,12 +89,67 @@ class CrawlJob:
 
     def __repr__(self):
         """
-        نمایش رشته‌ای کار
+        نمایش رشته‌ای کار برای توسعه‌دهندگان
 
         Returns:
             str: رشته نمایشی
         """
         return self.__str__()
+
+    def get_info(self):
+        """
+        دریافت اطلاعات کار به صورت دیکشنری
+
+        Returns:
+            dict: اطلاعات کار
+        """
+        return {
+            'url': self.url,
+            'depth': self.depth,
+            'priority': self.priority,
+            'job_type': self.job_type,
+            'domain': self.domain,
+            'path': self.path,
+            'parent_url': self.parent_url,
+            'created_at': self.created_at.isoformat()
+        }
+
+    def is_high_priority(self):
+        """
+        بررسی اینکه آیا کار اولویت بالایی دارد
+
+        Returns:
+            bool: آیا کار اولویت بالایی دارد؟
+        """
+        # اولویت کمتر از صفر به معنای اولویت بالا است
+        return self.priority < 0
+
+    def is_sitemap(self):
+        """
+        بررسی اینکه آیا کار از نوع نقشه سایت است
+
+        Returns:
+            bool: آیا کار از نوع نقشه سایت است؟
+        """
+        return self.job_type == 'sitemap'
+
+    def is_list_page(self):
+        """
+        بررسی اینکه آیا کار از نوع صفحه لیستی است
+
+        Returns:
+            bool: آیا کار از نوع صفحه لیستی است؟
+        """
+        return self.job_type == 'list'
+
+    def is_detail_page(self):
+        """
+        بررسی اینکه آیا کار از نوع صفحه جزئیات است
+
+        Returns:
+            bool: آیا کار از نوع صفحه جزئیات است؟
+        """
+        return self.job_type == 'detail'
 
 
 class CrawlState:
@@ -289,8 +345,8 @@ class CrawlState:
             rate = self.stats['successful_urls'] / max(elapsed, 1) * 60
 
             stats = self.stats.copy()
-            stats['elapsed_seconds'] = elapsed
-            stats['urls_per_minute'] = rate
+            stats['elapsed_seconds'] = int(elapsed)
+            stats['urls_per_minute'] = int(rate)
 
             return stats
 
@@ -470,6 +526,14 @@ class URLPriorityPolicyManager:
             weight=1.0
         )
 
+        # سیاست sitemap: اولویت بالا برای سایت‌مپ‌ها
+        self.add_policy(
+            name="sitemap_policy",
+            condition_func=lambda url, job: job is not None and job.job_type == 'sitemap',
+            priority_func=lambda url, job: -30,  # اولویت بسیار بالا
+            weight=2.0
+        )
+
         # سیاست مسیر کوتاه: اولویت بالاتر برای URL‌های با مسیر کوتاهتر
         self.add_policy(
             name="path_length_policy",
@@ -485,7 +549,7 @@ class Crawler:
     """کلاس اصلی خزشگر هوشمند"""
 
     def __init__(self, base_url, config_dir=None, max_threads=4, max_depth=5, politeness_delay=1.0,
-                 respect_robots=True):
+                 respect_robots=False, use_db_storage=True):
         """
         مقداردهی اولیه خزشگر
 
@@ -496,6 +560,7 @@ class Crawler:
             max_depth: حداکثر عمق خزش
             politeness_delay: تأخیر بین درخواست‌ها برای رعایت ادب (ثانیه)
             respect_robots: آیا محدودیت‌های robots.txt رعایت شود؟
+            use_db_storage: آیا داده‌ها در دیتابیس ذخیره شوند؟
         """
         self.base_url = base_url
         self.config_dir = config_dir or os.path.join(
@@ -511,6 +576,7 @@ class Crawler:
         self.max_depth = int(os.getenv('MAX_DEPTH', max_depth))
         self.politeness_delay = float(os.getenv('CRAWL_DELAY', politeness_delay))
         self.respect_robots = respect_robots
+        self.use_db_storage = use_db_storage
 
         # تنظیم دامنه اصلی
         self.domain = urlparse(base_url).netloc
@@ -533,7 +599,7 @@ class Crawler:
         self.request_manager = RequestManager(
             base_url=base_url,
             default_delay=self.politeness_delay,
-            respect_robots=self.respect_robots
+            respect_robots=False  # همیشه محدودیت‌های robots.txt را نادیده می‌گیریم
         )
 
         # متغیرهای کنترل خزش
@@ -547,6 +613,60 @@ class Crawler:
         self.last_job_time = datetime.now()
         self.checkpoint_interval = 300  # ۵ دقیقه
         self.last_checkpoint_time = datetime.now()
+
+        # آمار ذخیره‌سازی
+        self.storage_stats = {
+            'stored_content_count': 0,
+            'failed_storage_count': 0,
+            'stored_by_type': {}
+        }
+
+        # اضافه کردن ماژول‌های استخراج، طبقه‌بندی و ذخیره‌سازی
+        if self.use_db_storage:
+            try:
+                from core.content_extractor import ContentExtractor
+                from core.classifier import TextClassifier
+                from core.storage import StorageManager
+
+                self.content_extractor = ContentExtractor()
+                self.classifier = TextClassifier()
+                self.storage_manager = StorageManager()
+
+                logger.info("ماژول‌های استخراج، طبقه‌بندی و ذخیره‌سازی با موفقیت بارگذاری شدند")
+            except Exception as e:
+                logger.error(f"خطا در بارگذاری ماژول‌های استخراج، طبقه‌بندی یا ذخیره‌سازی: {str(e)}")
+                self.use_db_storage = False
+
+    def extract_sitemap_from_robots(self):
+        """
+        استخراج آدرس sitemap از فایل robots.txt
+
+        Returns:
+            list: لیست آدرس‌های sitemap یا None در صورت خطا
+        """
+        try:
+            robots_url = urljoin(self.base_url, "/robots.txt")
+            logger.info(f"در حال استخراج sitemap از {robots_url}...")
+
+            response = self.request_manager.get(robots_url, use_selenium=False)
+
+            if not response.get('html'):
+                logger.warning(f"فایل robots.txt در {robots_url} یافت نشد")
+                return None
+
+            # جستجوی خط‌های sitemap در فایل robots.txt
+            sitemap_urls = []
+            for line in response.get('html').splitlines():
+                line = line.strip()
+                if line.lower().startswith('sitemap:'):
+                    sitemap_url = line.split(':', 1)[1].strip()
+                    logger.info(f"آدرس sitemap یافت شد: {sitemap_url}")
+                    sitemap_urls.append(sitemap_url)
+
+            return sitemap_urls
+        except Exception as e:
+            logger.error(f"خطا در استخراج sitemap: {str(e)}")
+            return None
 
     def discover_site_structure(self, force=False):
         """
@@ -571,7 +691,7 @@ class Crawler:
             depth: عمق URL در گراف خزش
             priority: اولویت (اختیاری، محاسبه خودکار در صورت عدم ارائه)
             parent_url: آدرس URL والد (اختیاری)
-            job_type: نوع کار ('page', 'list', 'detail', 'api', etc.)
+            job_type: نوع کار ('page', 'list', 'detail', 'sitemap', etc.)
 
         Returns:
             bool: آیا کار با موفقیت اضافه شد؟
@@ -579,20 +699,22 @@ class Crawler:
         # نرمالایز کردن URL
         normalized_url = normalize_url(url)
 
-        # بررسی آیا این URL قبلاً بازدید شده یا در صف است
-        if self.crawl_state.was_visited(normalized_url) or self.crawl_state.is_in_progress(normalized_url):
-            self.crawl_state.stats['skipped_urls'] += 1
-            return False
+        # اگر نوع کار sitemap است، بدون بررسی اضافه می‌کنیم
+        if job_type != 'sitemap':
+            # بررسی آیا این URL قبلاً بازدید شده یا در صف است
+            if self.crawl_state.was_visited(normalized_url) or self.crawl_state.is_in_progress(normalized_url):
+                self.crawl_state.stats['skipped_urls'] += 1
+                return False
 
-        # بررسی محدودیت عمق
-        if depth > self.max_depth:
-            self.crawl_state.stats['skipped_urls'] += 1
-            return False
+            # بررسی محدودیت عمق
+            if depth > self.max_depth:
+                self.crawl_state.stats['skipped_urls'] += 1
+                return False
 
-        # بررسی محدودیت دامنه (فقط URL‌های داخلی)
-        if self.domain != urlparse(normalized_url).netloc:
-            self.crawl_state.stats['skipped_urls'] += 1
-            return False
+            # بررسی محدودیت دامنه (فقط URL‌های داخلی)
+            if self.domain != urlparse(normalized_url).netloc:
+                self.crawl_state.stats['skipped_urls'] += 1
+                return False
 
         # تشخیص نوع کار اگر ارائه نشده
         if job_type is None:
@@ -645,6 +767,10 @@ class Crawler:
             # لاگ اطلاعات کار
             crawler_logger.info(f"خزش {url} (عمق {job.depth}, اولویت {job.priority}, نوع {job.job_type})")
 
+            # اگر کار از نوع sitemap است، به طور ویژه پردازش می‌کنیم
+            if job.job_type == 'sitemap':
+                return self._process_sitemap_job(job)
+
             # درخواست صفحه
             use_selenium = job.job_type in ['list', 'detail']  # استفاده از سلنیوم برای صفحات پیچیده‌تر
             response = self.request_manager.get(url, use_selenium=use_selenium)
@@ -672,8 +798,56 @@ class Crawler:
             soup = response.get('soup')
             final_url = response.get('url')  # URL نهایی پس از ریدایرکت
 
-            # استخراج اطلاعات بر اساس نوع صفحه
-            extracted_data = self._extract_page_data(final_url, html_content, soup, job.job_type)
+            # ذخیره نتایج استخراج و طبقه‌بندی
+            storage_result = None
+            extracted_data = None
+            classification_result = None
+
+            # استخراج و طبقه‌بندی محتوا با استفاده از ماژول‌های جدید
+            if self.use_db_storage and hasattr(self, 'content_extractor') and hasattr(self, 'classifier'):
+                try:
+                    # استخراج محتوا
+                    extracted_data = self.content_extractor.extract(html_content, final_url, job_type=job.job_type)
+
+                    # طبقه‌بندی محتوا
+                    if 'content' in extracted_data and extracted_data['content']:
+                        classification_result = self.classifier.classify_text(extracted_data['content'])
+
+                        # افزودن نتایج طبقه‌بندی به داده‌های استخراج شده
+                        if 'content_type' in classification_result:
+                            extracted_data['content_type'] = classification_result['content_type'].get('content_type',
+                                                                                                       'other')
+
+                        if 'domains' in classification_result:
+                            extracted_data['domains'] = classification_result['domains'].get('domains', [])
+
+                    # ذخیره محتوا در دیتابیس
+                    if hasattr(self, 'storage_manager'):
+                        storage_result = self.storage_manager.store_content(extracted_data)
+
+                        if storage_result:
+                            logger.info(f"محتوای {url} با موفقیت در دیتابیس ذخیره شد (ID: {storage_result.id})")
+
+                            # به‌روزرسانی آمار ذخیره‌سازی
+                            with self.stats_lock:
+                                self.storage_stats['stored_content_count'] += 1
+                                content_type = extracted_data.get('content_type', 'other')
+                                self.storage_stats['stored_by_type'][content_type] = self.storage_stats[
+                                                                                         'stored_by_type'].get(
+                                    content_type, 0) + 1
+                        else:
+                            logger.warning(f"محتوای {url} در دیتابیس ذخیره نشد")
+                            with self.stats_lock:
+                                self.storage_stats['failed_storage_count'] += 1
+
+                except Exception as e:
+                    logger.error(f"خطا در استخراج، طبقه‌بندی یا ذخیره‌سازی محتوای {url}: {str(e)}")
+                    with self.stats_lock:
+                        self.storage_stats['failed_storage_count'] += 1
+
+            # اگر استخراج با ماژول‌های جدید انجام نشد، از روش قدیمی استفاده می‌کنیم
+            if extracted_data is None:
+                extracted_data = self._extract_page_data(final_url, html_content, soup, job.job_type)
 
             # استخراج لینک‌های جدید
             new_links = []
@@ -695,16 +869,16 @@ class Crawler:
 
                     # تشخیص نوع لینک
                     pattern = self.structure_discovery.get_url_pattern(normalized_link)
-                    job_type = 'page'
+                    link_job_type = 'page'
 
                     if pattern:
                         if pattern.is_list:
-                            job_type = 'list'
+                            link_job_type = 'list'
                         elif pattern.is_detail:
-                            job_type = 'detail'
+                            link_job_type = 'detail'
 
                     # محاسبه اولویت
-                    temp_job = CrawlJob(normalized_link, job.depth + 1, 0, final_url, final_url, job_type)
+                    temp_job = CrawlJob(normalized_link, job.depth + 1, 0, final_url, final_url, link_job_type)
                     priority = self.priority_manager.calculate_priority(normalized_link, temp_job)
 
                     # ایجاد و افزودن کار جدید
@@ -714,7 +888,7 @@ class Crawler:
                         priority,
                         final_url,
                         final_url,
-                        job_type
+                        link_job_type
                     )
 
                     self.job_queue.put(new_job)
@@ -736,7 +910,7 @@ class Crawler:
             # به‌روزرسانی زمان آخرین کار
             self.last_job_time = datetime.now()
 
-            return {
+            result = {
                 'success': True,
                 'url': url,
                 'final_url': final_url,
@@ -747,6 +921,16 @@ class Crawler:
                 'new_links': new_links,
                 'new_links_count': len(new_links)
             }
+
+            # افزودن اطلاعات طبقه‌بندی و ذخیره‌سازی به نتیجه
+            if classification_result:
+                result['classification'] = classification_result
+
+            if storage_result:
+                result['stored'] = True
+                result['stored_id'] = storage_result.id
+
+            return result
 
         except Exception as e:
             error_message = f"خطا در پردازش {url}: {str(e)}"
@@ -760,6 +944,216 @@ class Crawler:
                 'url': url,
                 'error': error_message
             }
+
+    def worker(self):
+        """تابع اجرایی نخ‌های کارگر"""
+        while not self.stop_event.is_set():
+            try:
+                # گرفتن یک کار از صف با زمان انتظار
+                try:
+                    job = self.job_queue.get(timeout=5)
+                except queue.Empty:
+                    # اگر صف خالی است، ادامه می‌دهیم بدون فراخوانی task_done
+                    continue
+
+                try:
+                    # پردازش کار
+                    result = self.process_job(job)
+
+                    # لاگ نتیجه
+                    if result['success']:
+                        crawler_logger.info(
+                            f"خزش موفق {job.url} - استخراج {result.get('new_links_count', 0) if 'new_links_count' in result else result.get('extracted_urls', 0)} لینک جدید"
+                        )
+                    else:
+                        crawler_logger.warning(f"خزش ناموفق {job.url} - {result.get('error')}")
+
+                    # بررسی زمان ذخیره نقطه بازیابی
+                    now = datetime.now()
+                    if (now - self.last_checkpoint_time).total_seconds() > self.checkpoint_interval:
+                        self.crawl_state.save_checkpoint()
+                        self.last_checkpoint_time = now
+                finally:
+                    # اعلام تکمیل کار به صف - فقط یک بار فراخوانی می‌شود، در بلوک finally
+                    self.job_queue.task_done()
+
+            except Exception as e:
+                logger.error(f"خطا در نخ کارگر: {str(e)}")
+                # در صورت خطا، نباید task_done را فراخوانی کنیم زیرا قبلاً این کار را انجام داده‌ایم
+
+    def start(self, initial_urls=None, load_checkpoint=True):
+        """
+        شروع فرآیند خزش
+
+        Args:
+            initial_urls: لیست آدرس‌های URL اولیه (اختیاری)
+            load_checkpoint: آیا نقطه بازیابی بارگذاری شود؟
+
+        Returns:
+            bool: آیا شروع خزش موفق بود؟
+        """
+        if self.running:
+            logger.warning("خزشگر از قبل در حال اجراست")
+            return False
+
+        # کشف ساختار سایت
+        self.discover_site_structure()
+
+        # بارگذاری نقطه بازیابی
+        if load_checkpoint:
+            self.crawl_state.load_checkpoint()
+
+        # ابتدا تلاش برای استخراج sitemap
+        sitemap_urls = self.extract_sitemap_from_robots()
+
+        # افزودن URL‌های اولیه
+        if sitemap_urls:
+            logger.info(f"استفاده از {len(sitemap_urls)} sitemap به عنوان نقاط شروع...")
+            for sitemap_url in sitemap_urls:
+                self.add_job(sitemap_url, depth=0, job_type='sitemap')
+        elif not initial_urls:
+            logger.info("استفاده از آدرس پایه به عنوان نقطه شروع...")
+            initial_urls = [self.base_url]
+            for url in initial_urls:
+                self.add_job(url, depth=0, job_type='page')
+        else:
+            logger.info(f"استفاده از {len(initial_urls)} آدرس اولیه...")
+            for url in initial_urls:
+                self.add_job(url, depth=0, job_type='page')
+
+        # راه‌اندازی نخ‌های کارگر
+        self.stop_event.clear()
+        self.threads = []
+
+        for i in range(self.max_threads):
+            thread = threading.Thread(
+                target=self.worker,
+                name=f"CrawlerWorker-{i + 1}",
+                daemon=True
+            )
+            thread.start()
+            self.threads.append(thread)
+
+        self.running = True
+        logger.info(f"خزشگر با {self.max_threads} نخ شروع به کار کرد")
+
+        return True
+
+    def stop(self, wait=True, save_checkpoint=True):
+        """
+        توقف فرآیند خزش
+
+        Args:
+            wait: آیا منتظر اتمام کارهای در حال انجام بمانیم؟
+            save_checkpoint: آیا نقطه بازیابی ذخیره شود؟
+
+        Returns:
+            bool: آیا توقف خزش موفق بود؟
+        """
+        if not self.running:
+            logger.warning("خزشگر در حال اجرا نیست")
+            return False
+
+        # علامت‌گذاری برای توقف
+        self.stop_event.set()
+
+        # انتظار برای اتمام کارها
+        if wait and self.threads:
+            for thread in self.threads:
+                thread.join(timeout=10)
+
+        # ذخیره نقطه بازیابی
+        if save_checkpoint:
+            self.crawl_state.save_checkpoint()
+
+        # بستن منابع
+        self.request_manager.close()
+
+        self.running = False
+        logger.info("خزشگر متوقف شد")
+
+        return True
+
+    def get_stats(self):
+        """
+        دریافت آمار خزش و ذخیره‌سازی
+
+        Returns:
+            dict: دیکشنری آمار
+        """
+        stats = self.crawl_state.get_stats()
+
+        # افزودن آمار اضافی
+        with self.stats_lock:
+            stats['max_queue_size'] = self.max_queue_size
+            stats['current_queue_size'] = self.job_queue.qsize()
+            stats['active_threads'] = sum(1 for thread in self.threads if thread.is_alive())
+
+            # افزودن آمار ذخیره‌سازی
+            stats['storage'] = self.storage_stats
+
+            # افزودن آمار استخراج محتوا
+            if self.use_db_storage and hasattr(self, 'content_extractor'):
+                try:
+                    stats['extraction'] = self.content_extractor.get_stats()
+                except Exception:
+                    pass
+
+            # افزودن آمار ذخیره‌سازی از StorageManager
+            if self.use_db_storage and hasattr(self, 'storage_manager'):
+                try:
+                    storage_stats = self.storage_manager.get_stats()
+                    stats['storage_manager'] = storage_stats
+                except Exception:
+                    pass
+
+        return stats
+
+    def is_running(self):
+        """
+        بررسی وضعیت اجرای خزشگر
+
+        Returns:
+            bool: آیا خزشگر در حال اجراست؟
+        """
+        return self.running and any(thread.is_alive() for thread in self.threads)
+
+    def wait_for_completion(self, timeout=None):
+        """
+        انتظار برای تکمیل تمام کارها
+
+        Args:
+            timeout: زمان انتظار حداکثر (ثانیه، None برای نامحدود)
+
+        Returns:
+            bool: آیا همه کارها تکمیل شدند؟
+        """
+        if not self.running:
+            return True
+
+        start_time = time.time()
+
+        try:
+            # انتظار برای تکمیل همه کارهای صف
+            self.job_queue.join()
+            return True
+        except (KeyboardInterrupt, Exception) as e:
+            logger.error(f"وقفه در انتظار برای تکمیل: {str(e)}")
+            return False
+
+    def __del__(self):
+        """آزادسازی منابع هنگام حذف شیء"""
+        if self.running:
+            self.stop(wait=False)
+
+    def join(self):
+        """انتظار برای اتمام کارها"""
+        try:
+            self.job_queue.join()
+        except (KeyboardInterrupt, Exception) as e:
+            logger.error(f"وقفه در انتظار برای اتمام کارها: {str(e)}")
+            return False
+        return True
 
     def _extract_page_data(self, url, html_content, soup, job_type):
         """
@@ -881,172 +1275,103 @@ class Crawler:
 
         return data
 
-    def worker(self):
-        """تابع اجرایی نخ‌های کارگر"""
-        while not self.stop_event.is_set():
-            try:
-                # گرفتن یک کار از صف با زمان انتظار
-                try:
-                    job = self.job_queue.get(timeout=5)
-                except queue.Empty:
-                    continue
-
-                # پردازش کار
-                result = self.process_job(job)
-
-                # لاگ نتیجه
-                if result['success']:
-                    crawler_logger.info(
-                        f"خزش موفق {job.url} - استخراج {result.get('new_links_count', 0)} لینک جدید"
-                    )
-                else:
-                    crawler_logger.warning(f"خزش ناموفق {job.url} - {result.get('error')}")
-
-                # بررسی زمان ذخیره نقطه بازیابی
-                now = datetime.now()
-                if (now - self.last_checkpoint_time).total_seconds() > self.checkpoint_interval:
-                    self.crawl_state.save_checkpoint()
-                    self.last_checkpoint_time = now
-
-            except Exception as e:
-                logger.error(f"خطا در نخ کارگر: {str(e)}")
-            finally:
-                # اعلام تکمیل کار به صف
-                if 'job' in locals():
-                    self.job_queue.task_done()
-
-    def start(self, initial_urls=None, load_checkpoint=True):
+    def _process_sitemap_job(self, job):
         """
-        شروع فرآیند خزش
+        پردازش یک کار از نوع sitemap
 
         Args:
-            initial_urls: لیست آدرس‌های URL اولیه (اختیاری)
-            load_checkpoint: آیا نقطه بازیابی بارگذاری شود؟
+            job: کار خزش برای پردازش
 
         Returns:
-            bool: آیا شروع خزش موفق بود؟
+            dict: نتیجه پردازش
         """
-        if self.running:
-            logger.warning("خزشگر از قبل در حال اجراست")
-            return False
-
-        # کشف ساختار سایت
-        self.discover_site_structure()
-
-        # بارگذاری نقطه بازیابی
-        if load_checkpoint:
-            self.crawl_state.load_checkpoint()
-
-        # افزودن URL‌های اولیه
-        if not initial_urls:
-            initial_urls = [self.base_url]
-
-        for url in initial_urls:
-            self.add_job(url, depth=0, job_type='page')
-
-        # راه‌اندازی نخ‌های کارگر
-        self.stop_event.clear()
-        self.threads = []
-
-        for i in range(self.max_threads):
-            thread = threading.Thread(
-                target=self.worker,
-                name=f"CrawlerWorker-{i + 1}",
-                daemon=True
-            )
-            thread.start()
-            self.threads.append(thread)
-
-        self.running = True
-        logger.info(f"خزشگر با {self.max_threads} نخ شروع به کار کرد")
-
-        return True
-
-    def stop(self, wait=True, save_checkpoint=True):
-        """
-        توقف فرآیند خزش
-
-        Args:
-            wait: آیا منتظر اتمام کارهای در حال انجام بمانیم؟
-            save_checkpoint: آیا نقطه بازیابی ذخیره شود؟
-
-        Returns:
-            bool: آیا توقف خزش موفق بود؟
-        """
-        if not self.running:
-            logger.warning("خزشگر در حال اجرا نیست")
-            return False
-
-        # علامت‌گذاری برای توقف
-        self.stop_event.set()
-
-        # انتظار برای اتمام کارها
-        if wait and self.threads:
-            for thread in self.threads:
-                thread.join(timeout=10)
-
-        # ذخیره نقطه بازیابی
-        if save_checkpoint:
-            self.crawl_state.save_checkpoint()
-
-        # بستن منابع
-        self.request_manager.close()
-
-        self.running = False
-        logger.info("خزشگر متوقف شد")
-
-        return True
-
-    def get_stats(self):
-        """
-        دریافت آمار خزش
-
-        Returns:
-            dict: دیکشنری آمار
-        """
-        stats = self.crawl_state.get_stats()
-
-        # افزودن آمار اضافی
-        with self.stats_lock:
-            stats['max_queue_size'] = self.max_queue_size
-            stats['current_queue_size'] = self.job_queue.qsize()
-            stats['active_threads'] = sum(1 for thread in self.threads if thread.is_alive())
-
-        return stats
-
-    def is_running(self):
-        """
-        بررسی وضعیت اجرای خزشگر
-
-        Returns:
-            bool: آیا خزشگر در حال اجراست؟
-        """
-        return self.running and any(thread.is_alive() for thread in self.threads)
-
-    def wait_for_completion(self, timeout=None):
-        """
-        انتظار برای تکمیل تمام کارها
-
-        Args:
-            timeout: زمان انتظار حداکثر (ثانیه، None برای نامحدود)
-
-        Returns:
-            bool: آیا همه کارها تکمیل شدند؟
-        """
-        if not self.running:
-            return True
-
-        start_time = time.time()
+        url = job.url
 
         try:
-            # انتظار برای تکمیل همه کارهای صف
-            self.job_queue.join()
-            return True
-        except (KeyboardInterrupt, Exception) as e:
-            logger.error(f"وقفه در انتظار برای تکمیل: {str(e)}")
-            return False
+            # درخواست فایل sitemap
+            response = self.request_manager.get(url, use_selenium=False)
 
-    def __del__(self):
-        """آزادسازی منابع هنگام حذف شیء"""
-        if self.running:
-            self.stop(wait=False)
+            if not response.get('html'):
+                self.crawl_state.add_failed(url, error="محتوای HTML دریافت نشد")
+                return {
+                    'success': False,
+                    'url': url,
+                    'error': "محتوای HTML دریافت نشد"
+                }
+
+            # پردازش فایل sitemap
+            try:
+                root = ET.fromstring(response.get('html'))
+
+                # تعیین namespace
+                namespaces = {'sm': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
+
+                # استخراج URLs
+                urls = []
+
+                # بررسی اگر این یک فایل sitemap index است
+                sitemap_tags = root.findall('.//sm:sitemap/sm:loc', namespaces)
+                if sitemap_tags:
+                    # این یک sitemap index است، باید هر فایل sitemap را جداگانه پردازش کنیم
+                    logger.info(f"فایل {url} یک sitemap index با {len(sitemap_tags)} sitemap است")
+                    for sitemap_tag in sitemap_tags:
+                        sitemap_url = sitemap_tag.text.strip()
+                        self.add_job(sitemap_url, depth=job.depth + 1, job_type='sitemap')
+                        urls.append(sitemap_url)
+                else:
+                    # این یک sitemap عادی است، آدرس‌های URL را استخراج می‌کنیم
+                    url_tags = root.findall('.//sm:url/sm:loc', namespaces)
+                    logger.info(f"فایل {url} یک sitemap با {len(url_tags)} آدرس است")
+                    for url_tag in url_tags:
+                        page_url = url_tag.text.strip()
+                        self.add_job(page_url, depth=0, job_type='page')
+                        urls.append(page_url)
+
+                # ثبت URL به عنوان بازدید شده
+                self.crawl_state.add_visited(url, status_code=response.get('status_code'), content_type='application/xml')
+
+                return {
+                    'success': True,
+                    'url': url,
+                    'final_url': response.get('url'),
+                    'job_type': 'sitemap',
+                    'depth': job.depth,
+                    'extracted_urls': len(urls),
+                    'sitemap_type': 'index' if sitemap_tags else 'regular'
+                }
+
+            except ET.ParseError:
+                # اگر XML نامعتبر است، ممکن است یک فایل متنی ساده باشد
+                lines = response.get('html').splitlines()
+                urls = []
+
+                for line in lines:
+                    line = line.strip()
+                    if line and not line.startswith('#'):  # نادیده گرفتن خطوط توضیح
+                        urls.append(line)
+                        self.add_job(line, depth=0, job_type='page')
+
+                # ثبت URL به عنوان بازدید شده
+                self.crawl_state.add_visited(url, status_code=response.get('status_code'), content_type='text/plain')
+
+                return {
+                    'success': True,
+                    'url': url,
+                    'final_url': response.get('url'),
+                    'job_type': 'sitemap',
+                    'depth': job.depth,
+                    'extracted_urls': len(urls),
+                    'sitemap_type': 'text'
+                }
+
+        except Exception as e:
+            error_message = f"خطا در پردازش sitemap {url}: {str(e)}"
+            logger.error(error_message)
+
+            self.crawl_state.add_failed(url, error=str(e))
+
+            return {
+                'success': False,
+                'url': url,
+                'error': error_message
+            }

@@ -10,18 +10,18 @@ services:
     env_file:
       - .env
     depends_on:
-      - db
+      db:
+        condition: service_healthy  # صبر کن تا دیتابیس سالم باشد
     networks:
       - crawler-network
+    restart: unless-stopped
 
   db:
-    image: mysql:8.0
+    image: mysql:8.0.30
     restart: always
     environment:
       MYSQL_ROOT_PASSWORD: root_password
       MYSQL_DATABASE: legal_crawler
-      MYSQL_USER: crawler
-      MYSQL_PASSWORD: crawler_password
     volumes:
       - db_data:/var/lib/mysql
     ports:
@@ -29,6 +29,31 @@ services:
     command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
     networks:
       - crawler-network
+    healthcheck:  # بررسی سلامت دیتابیس
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot_password"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    restart: always
+    environment:
+      PMA_HOST: db
+      PMA_USER: root
+      PMA_PASSWORD: root_password
+      UPLOAD_LIMIT: 300M
+      MEMORY_LIMIT: 512M
+      MAX_EXECUTION_TIME: 300
+    ports:
+      - "8080:80"
+    depends_on:
+      - db
+    networks:
+      - crawler-network
+    volumes:
+      - phpmyadmin_data:/sessions
 
 networks:
   crawler-network:
@@ -36,3 +61,4 @@ networks:
 
 volumes:
   db_data:
+  phpmyadmin_data:

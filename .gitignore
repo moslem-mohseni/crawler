@@ -1,0 +1,55 @@
+# محیط مجازی پایتون
+venv/
+env/
+ENV/
+virtualenv/
+.venv/
+.env/
+.ENV/
+.virtualenv/
+
+# فایل‌های لاگ
+*.log
+log/
+logs/
+logging/
+
+# کش پایتون
+__pycache__/
+*.py[cod]
+*$py.class
+
+# فایل‌های توزیع و ساخت
+dist/
+build/
+*.egg-info/
+*.egg
+.eggs/
+MANIFEST
+
+# فایل‌های محیطی
+.env
+.env.*
+!.env.example
+
+# دیتابیس‌های محلی
+*.db
+*.sqlite
+*.sqlite3
+
+# فایل‌های موقتی
+*~
+.*.swp
+.*.swo
+tmp/
+temp/
+
+# فایل‌های بزرگ داده
+*.csv
+*.json
+*.parquet
+*.h5
+*.pkl
+*.pt
+!examples/*.csv
+!examples/*.json

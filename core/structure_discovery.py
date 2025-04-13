@@ -4,21 +4,25 @@
 این ماژول شامل کلاس‌ها و الگوریتم‌های شناسایی خودکار ساختار وبسایت و الگوهای URL است.
 """
 
+from utils.logger import get_logger
+
+# تنظیم لاگر
+logger = get_logger(__name__)
+
 import re
 import os
 import json
 import time
 from urllib.parse import urlparse, parse_qs, urljoin
-from collections import defaultdict, Counter
+from collections import defaultdict
 import numpy as np
 from sklearn.cluster import DBSCAN
 from bs4 import BeautifulSoup
 
-from utils.logger import get_logger
-from utils.http import RequestManager, normalize_url
+from utils.http import RequestManager
+from database.operations import BaseDBOperations
+from models.domain import Domain
 
-# تنظیم لاگر
-logger = get_logger(__name__)
 
 class URLPattern:
     """کلاس الگوی URL برای شناسایی و دسته‌بندی آدرس‌ها"""
@@ -863,7 +867,7 @@ class URLStructureDiscovery:
         # ایجاد ویژگی‌های بردار برای هر URL
         url_features = self._extract_url_features()
 
-        if not url_features or len(url_features) < min_samples:
+        if url_features is None or url_features.size == 0 or len(url_features) < min_samples:
             logger.warning("تعداد URL‌ها برای خوشه‌بندی کافی نیست یا ویژگی‌ها استخراج نشدند")
             return self._discover_patterns_with_heuristics()
 
@@ -929,7 +933,7 @@ class URLStructureDiscovery:
                         if part.isdigit():
                             features[i, j + 1] = -1
                         # اگر slug است (حاوی خط تیره)
-                        elif '-' in part:
+                        elif isinstance(part, str) and '-' in part:
                             features[i, j + 1] = -2
                         else:
                             features[i, j + 1] = hash(part) % 1000000
@@ -1004,13 +1008,13 @@ class URLStructureDiscovery:
             values = [v for v in values if v is not None]
 
             # اگر همه مقادیر یکسان هستند
-            if all(values) and len(set(values)) == 1:
+            if len(values) > 0 and all(v is not None for v in values) and len(set(values)) == 1:
                 pattern_parts.append(values[0])
             # اگر مقادیر متفاوت اما همه عددی هستند
-            elif all(v.isdigit() for v in values if v):
+            elif values and all(v.isdigit() for v in values if v):
                 pattern_parts.append("*")
             # اگر مقادیر متفاوت و اکثراً slug هستند
-            elif sum(1 for v in values if '-' in v) > len(values) * 0.7:
+            elif sum(1 for v in values if isinstance(v, str) and '-' in v) > len(values) * 0.7:
                 pattern_parts.append("*")
             # اگر مقادیر متفاوت هستند
             else:
@@ -1284,7 +1288,6 @@ class URLStructureDiscovery:
 
         return pattern
 
-
 class StructureDiscovery:
     """کلاس اصلی شناسایی ساختار وبسایت"""
 
@@ -1307,6 +1310,7 @@ class StructureDiscovery:
 
         # مسیر فایل‌های پیکربندی
         self.domain = urlparse(base_url).netloc
+        self.domain_id = f"domain_{self.domain.replace('.', '_')}"
         self.url_patterns_file = os.path.join(self.config_dir, f"{self.domain}_url_patterns.json")
         self.html_patterns_file = os.path.join(self.config_dir, f"{self.domain}_html_patterns.json")
 
@@ -1317,6 +1321,9 @@ class StructureDiscovery:
         self.url_discoverer = URLStructureDiscovery(base_url=base_url)
         self.html_discoverer = HTMLPatternFinder()
 
+        # دسترسی به دیتابیس
+        self.db_ops = BaseDBOperations()
+
         # وضعیت شناسایی
         self.discovered = False
 
@@ -1324,19 +1331,79 @@ class StructureDiscovery:
         self._load_patterns()
 
     def _load_patterns(self):
-        """بارگذاری الگوهای ذخیره شده در صورت وجود"""
+        """بارگذاری الگوهای ذخیره شده از دیتابیس یا فایل"""
+        # ابتدا تلاش برای بارگذاری از دیتابیس
+        db_loaded = self._load_patterns_from_db()
+
+        # اگر از دیتابیس بارگذاری نشد، از فایل تلاش می‌کنیم
+        file_loaded = False
+        if not db_loaded:
+            file_loaded = self._load_patterns_from_files()
+
+        self.discovered = db_loaded or file_loaded
+
+        if self.discovered:
+            logger.info("الگوهای ساختاری با موفقیت بارگذاری شدند")
+        else:
+            logger.info("نیاز به کشف الگوهای ساختاری جدید")
+
+    def _load_patterns_from_db(self):
+        """بارگذاری الگوهای ذخیره شده از دیتابیس"""
+        try:
+            # بررسی وجود دامنه در دیتابیس
+            domain = self.db_ops.get_by_id(Domain, self.domain_id)
+
+            if not domain:
+                logger.info(f"دامنه {self.domain_id} در دیتابیس یافت نشد")
+                return False
+
+            # بارگذاری الگوهای URL از دیتابیس
+            if domain.keywords:
+                # تبدیل JSON به داده پایتون
+                if isinstance(domain.keywords, str):
+                    domain_data = json.loads(domain.keywords)
+                else:
+                    domain_data = domain.keywords
+
+                # اگر داده شامل الگوهای URL است
+                if 'patterns' in domain_data:
+                    patterns = []
+                    for pattern_data in domain_data['patterns']:
+                        pattern = URLPattern.from_dict(pattern_data)
+                        patterns.append(pattern)
+
+                    self.url_discoverer.patterns = patterns
+
+                # اگر داده شامل بخش‌های مهم است
+                if 'important_sections' in domain_data:
+                    self.url_discoverer.important_sections = domain_data['important_sections']
+
+                # بارگذاری الگوهای HTML (بسته به ساختار داده)
+                if 'html_patterns' in domain_data:
+                    # بازسازی الگوهای HTML
+                    self.html_discoverer.list_selectors = domain_data.get('html_patterns', {}).get('list_selectors', {})
+                    self.html_discoverer.detail_selectors = domain_data.get('html_patterns', {}).get('detail_selectors',
+                                                                                                     {})
+
+                logger.info(f"الگوهای ساختاری برای دامنه {self.domain} با موفقیت از دیتابیس بارگذاری شدند")
+                return True
+            else:
+                logger.info(f"کلیدواژه‌های دامنه {self.domain_id} در دیتابیس خالی است")
+                return False
+
+        except Exception as e:
+            logger.error(f"خطا در بارگذاری الگوها از دیتابیس: {str(e)}")
+            return False
+
+    def _load_patterns_from_files(self):
+        """بارگذاری الگوهای ذخیره شده از فایل‌ها"""
         # بارگذاری الگوهای URL
         url_patterns_loaded = self.url_discoverer.load_patterns(self.url_patterns_file)
 
         # بارگذاری الگوهای HTML
         html_patterns_loaded = self.html_discoverer.load_patterns(self.html_patterns_file)
 
-        self.discovered = url_patterns_loaded and html_patterns_loaded
-
-        if self.discovered:
-            logger.info("الگوهای ساختاری با موفقیت از فایل‌های پیکربندی بارگذاری شدند")
-        else:
-            logger.info("نیاز به کشف الگوهای ساختاری جدید")
+        return url_patterns_loaded and html_patterns_loaded
 
     def is_discovered(self):
         """
@@ -1429,8 +1496,7 @@ class StructureDiscovery:
             # ذخیره الگوهای کشف شده
             if save:
                 logger.info("ذخیره الگوهای کشف شده...")
-                self.url_discoverer.save_patterns(self.url_patterns_file)
-                self.html_discoverer.save_patterns(self.html_patterns_file)
+                self.save_patterns()
 
             self.discovered = True
 
@@ -1441,12 +1507,80 @@ class StructureDiscovery:
             logger.error(f"خطا در کشف ساختار: {str(e)}")
             return False
 
+    def save_patterns(self):
+        """ذخیره الگوهای کشف شده در دیتابیس و فایل"""
+        # ذخیره در فایل (برای سازگاری با گذشته)
+        self._save_patterns_to_files()
+
+        # ذخیره در دیتابیس
+        return self._save_patterns_to_db()
+
+    def _save_patterns_to_files(self):
+        """ذخیره الگوهای کشف شده در فایل‌ها"""
+        # ذخیره الگوهای URL در فایل
+        url_saved = self.url_discoverer.save_patterns(self.url_patterns_file)
+
+        # ذخیره الگوهای HTML در فایل
+        html_saved = self.html_discoverer.save_patterns(self.html_patterns_file)
+
+        if url_saved and html_saved:
+            logger.info(f"الگوهای ساختاری با موفقیت در فایل‌ها ذخیره شدند")
+            return True
+        else:
+            logger.warning(f"مشکل در ذخیره الگوهای ساختاری در فایل‌ها")
+            return False
+
+    def _save_patterns_to_db(self):
+        """ذخیره الگوهای کشف شده در دیتابیس"""
+        try:
+            # آماده‌سازی داده‌های الگوها
+            patterns_data = [pattern.to_dict() for pattern in self.url_discoverer.patterns]
+
+            # تهیه دیکشنری داده‌های دامنه
+            domain_data = {
+                'patterns': patterns_data,
+                'important_sections': self.url_discoverer.important_sections,
+                'html_patterns': {
+                    'list_selectors': self.html_discoverer.list_selectors,
+                    'detail_selectors': self.html_discoverer.detail_selectors
+                }
+            }
+
+            # بررسی وجود دامنه در دیتابیس
+            domain = self.db_ops.get_by_id(Domain, self.domain_id)
+
+            if domain:
+                # به‌روزرسانی دامنه موجود
+                self.db_ops.update(
+                    Domain,
+                    self.domain_id,
+                    keywords=json.dumps(domain_data, ensure_ascii=False)
+                )
+                logger.info(f"الگوهای ساختاری برای دامنه {self.domain_id} در دیتابیس به‌روزرسانی شدند")
+            else:
+                # ایجاد دامنه جدید
+                new_domain = Domain.create(
+                    id=self.domain_id,
+                    name=self.domain,
+                    description=f"Domain patterns for {self.domain}",
+                    keywords=json.dumps(domain_data, ensure_ascii=False),
+                    auto_detected=True
+                )
+                self.db_ops.create(new_domain)
+                logger.info(f"دامنه جدید {self.domain_id} با الگوهای ساختاری در دیتابیس ایجاد شد")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"خطا در ذخیره الگوها در دیتابیس: {str(e)}")
+            return False
+
     def _extract_links(self, html_content, base_url):
         """
         استخراج لینک‌های داخلی از یک صفحه
 
         Args:
-            html_content: محتوای HTML صفحه
+            html_content: محتوای HTML
             base_url: آدرس پایه برای تکمیل لینک‌های نسبی
 
         Returns:
@@ -1578,3 +1712,4 @@ class StructureDiscovery:
         """بستن منابع و اتصالات"""
         if self.request_manager:
             self.request_manager.close()
+

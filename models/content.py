@@ -4,8 +4,7 @@
 این ماژول مدل‌های داده مربوط به محتوا و روابط آن را تعریف می‌کند.
 """
 
-import hashlib
-from sqlalchemy import Column, BigInteger, String, Text, Integer, Float, Enum, JSON, ForeignKey, DateTime, Table
+from sqlalchemy import Column, BigInteger, String, Text, Integer, Float, Enum, JSON, ForeignKey, DateTime
 from sqlalchemy.orm import relationship
 from sqlalchemy.ext.hybrid import hybrid_property
 
@@ -83,16 +82,24 @@ class ContentItem(BaseModel):
         if not content:
             return None
 
-        # حذف فضاهای خالی اضافی و یکسان‌سازی
-        normalized_content = ' '.join(content.split())
+        # حذف فاصله‌های اضافی و نرمال‌سازی متن
+        from utils.text import normalize_persian_text
+        normalized_content = normalize_persian_text(content)
 
+        # گرفتن بخش مهم متن (مثلاً 1000 کاراکتر اول)
+        if len(normalized_content) > 1000:
+            signature_content = normalized_content[:1000]
+        else:
+            signature_content = normalized_content
+
+        # محاسبه هش
+        import hashlib
         if method == 'md5':
-            return hashlib.md5(normalized_content.encode('utf-8')).hexdigest()
+            return hashlib.md5(signature_content.encode('utf-8')).hexdigest()
         elif method == 'sha256':
-            return hashlib.sha256(normalized_content.encode('utf-8')).hexdigest()
+            return hashlib.sha256(signature_content.encode('utf-8')).hexdigest()
 
-        # پیش‌فرض به md5
-        return hashlib.md5(normalized_content.encode('utf-8')).hexdigest()
+        return hashlib.md5(signature_content.encode('utf-8')).hexdigest()
 
     def update_content(self, new_content, update_hash=True):
         """
@@ -131,7 +138,8 @@ class ContentItem(BaseModel):
         Returns:
             str: رشته نمایشی
         """
-        return f"<ContentItem(id={self.id}, title='{self.title if self.title else ''}', type='{self.content_type}', status='{self.status}')>"
+        return f"<ContentItem(id={self.id}, title='{self.title if self.title else ''}', type='{self.content_type}', " \
+               f"status='{self.status}')> "
 
 
 class Answer(BaseModel):
@@ -243,4 +251,5 @@ class DomainContent(BaseModel):
         Returns:
             str: رشته نمایشی
         """
-        return f"<DomainContent(domain_id='{self.domain_id}', content_id={self.content_id}, relevance={self.relevance_score})>"
+        return f"<DomainContent(domain_id='{self.domain_id}', content_id={self.content_id}, " \
+               f"relevance={self.relevance_score})> "
